@@ -134,6 +134,7 @@ eConsole.on('error', onError);
 
 // Add URL tracking
 function sendFullUrl() {
+  console.log('Sending URL:', window.location.href, window.location.pathname);
   parent.postMessage({
     type: 'FULL_URL',
     url: window.location.href,
