@@ -131,3 +131,15 @@ eConsole.on('error', onError);
 ].map((method) => {
   eConsole.on(method, (...args) => forwardLog(method, args));
 });
+
+// Add URL tracking
+function sendFullUrl() {
+  parent.postMessage({
+    type: 'FULL_URL',
+    url: window.location.href,
+    path: window.location.pathname
+  }, '*');
+}
+
+window.addEventListener('load', sendFullUrl);
+window.addEventListener('popstate', sendFullUrl);
