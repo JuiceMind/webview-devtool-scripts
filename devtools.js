@@ -54,8 +54,15 @@ try {
   const storedLastTool = localStorage.getItem(lastToolStorageKey);
   if (storedLastTool) {
     lastTool = storedLastTool;
+    isDevtoolsShown = true;
+    // First show the devtools
     eruda.show();
-    devtools.showTool(lastTool);
+    // Then explicitly set the tool and force a UI update
+    setTimeout(() => {
+      devtools.showTool(lastTool);
+      // Force the UI to update to match the selected tool
+      devtools.get(lastTool).show();
+    }, 0);
   }
 } catch { }
 
