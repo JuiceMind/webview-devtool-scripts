@@ -273,9 +273,19 @@
     }
   }
 
+  // The empty area below the page content belongs to <html> (browsers just
+  // paint the body's background across it), so students read it as "the
+  // body". Map hits on <html> to <body> — like classic Web Lab, <html>
+  // itself has no source mapping anyway.
+  function normalizeTarget(el) {
+    return el === document.documentElement ? document.body : el;
+  }
+
   function onMouseMove(event) {
-    var el = document.elementFromPoint(event.clientX, event.clientY);
-    setHover(isInspectable(el) ? el : null);
+    var el = normalizeTarget(
+      document.elementFromPoint(event.clientX, event.clientY),
+    );
+    setHover(el && isInspectable(el) ? el : null);
   }
 
   function onMouseLeave() {
@@ -285,8 +295,10 @@
   function onClick(event) {
     event.preventDefault();
     event.stopPropagation();
-    var el = document.elementFromPoint(event.clientX, event.clientY);
-    if (!isInspectable(el)) {
+    var el = normalizeTarget(
+      document.elementFromPoint(event.clientX, event.clientY),
+    );
+    if (!el || !isInspectable(el)) {
       return;
     }
     pinnedEl = el;
@@ -376,7 +388,12 @@
       try {
         var nodeList = document.querySelectorAll(data.selector);
         for (var i = 0; i < nodeList.length; i++) {
-          if (!isInjectedNode(nodeList[i]) && isInspectable(nodeList[i])) {
+          // Unlike hover, allow <html> here so `html { ... }` rules light up.
+          if (
+            !isInjectedNode(nodeList[i]) &&
+            (nodeList[i] === document.documentElement ||
+              isInspectable(nodeList[i]))
+          ) {
             matches.push(nodeList[i]);
           }
         }
