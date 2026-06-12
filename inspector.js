@@ -25,6 +25,30 @@
 
   var OWN_ATTR = 'data-jm-inspector';
 
+  // Overlay stacking contract: iframe shields sit under the highlight boxes
+  // (so a shielded iframe's hover box still shows), and the chip tops all.
+  var Z_IFRAME_SHIELD = 2147483645;
+  var Z_HIGHLIGHT_BOX = 2147483646;
+  var Z_CHIP = 2147483647;
+
+  // Shared look of every highlight box (hover and programmatic).
+  var HIGHLIGHT_BOX_CSS =
+    'position:fixed;z-index:' +
+    Z_HIGHLIGHT_BOX +
+    ';pointer-events:none;' +
+    'background:rgba(99,155,255,0.25);border:1px solid #639bff;' +
+    'border-radius:2px;display:none;';
+
+  // The chip sits this far above the element; with no room it flips below.
+  var CHIP_HEIGHT_PX = 24;
+  var CHIP_FLIP_GAP_PX = 4;
+
+  // domPath segment shape, e.g. "div:nth-of-type(2)". Case-insensitive so
+  // spec-cased foreign elements (foreignObject, clipPath, ...) pass.
+  var SEGMENT_REGEX = /^([a-z0-9-]+):nth-of-type\((\d+)\)$/i;
+
+  // --- State ---
+
   var enabled = false;
   var hoverEl = null;
   var pinnedEl = null;
@@ -32,15 +56,27 @@
   var chip = null;
   var cursorStyle = null;
   var repositionAttached = false;
+  // Transparent blockers drawn over nested iframes while the inspector is
+  // on: mouse events over an embed go to the inner document, so without a
+  // shield the <iframe> can't be hovered/selected and its clicks aren't
+  // swallowed like every other click.
+  var iframeShields = [];
+  // Origin of the embedding IDE, learned from its first accepted message;
+  // descriptors are only posted back to that origin.
+  var parentOrigin = '*';
   // Reverse-direction ("Live Highlight") state: elements highlighted from the
   // editor, and the pool of overlay divs drawn on them.
   var programmaticEls = [];
   var programmaticBoxes = [];
   var MAX_PROGRAMMATIC_HIGHLIGHTS = 50;
 
+  // --- Parent messaging ---
+
   function post(type, payload) {
-    parent.postMessage({ type: type, payload: payload }, '*');
+    parent.postMessage({ type: type, payload: payload }, parentOrigin);
   }
+
+  // --- Element classification & descriptors (live DOM -> protocol) ---
 
   // Nodes we (or the other devtool scripts) put on the page. They must be
   // invisible to hit-testing AND to sibling counting, so student domPaths
@@ -65,6 +101,16 @@
     return true;
   }
 
+  // HTML tagNames read uppercase from the live DOM while foreign elements
+  // (SVG/MathML, e.g. foreignObject/clipPath) keep their spec case — which
+  // is also how the source-side parser reports them. Lowercase only HTML so
+  // path segments stay comparable on both sides.
+  function pathTagName(node) {
+    return node.namespaceURI === 'http://www.w3.org/1999/xhtml'
+      ? node.tagName.toLowerCase()
+      : node.tagName;
+  }
+
   // Structural path from <body> down, e.g.
   // ["body", "div:nth-of-type(1)", "p:nth-of-type(2)"]. nth-of-type counts
   // same-tag element siblings only, skipping injected nodes.
@@ -75,12 +121,17 @@
       var index = 0;
       var sib = node;
       while (sib) {
-        if (sib.tagName === node.tagName && !isInjectedNode(sib)) {
+        // Case-insensitive to mirror how both resolvers count (live DOM
+        // uppercase vs parser lowercase/spec-case).
+        if (
+          sib.tagName.toLowerCase() === node.tagName.toLowerCase() &&
+          !isInjectedNode(sib)
+        ) {
           index++;
         }
         sib = sib.previousElementSibling;
       }
-      path.unshift(node.tagName.toLowerCase() + ':nth-of-type(' + index + ')');
+      path.unshift(pathTagName(node) + ':nth-of-type(' + index + ')');
       node = node.parentElement;
     }
     if (node !== document.body) {
@@ -93,15 +144,17 @@
   function getDescriptor(el) {
     return {
       pagePath: window.location.pathname,
-      tagName: el.tagName.toLowerCase(),
+      tagName: pathTagName(el),
       id: el.id || '',
       classes: Array.prototype.slice.call(el.classList),
       domPath: getDomPath(el),
     };
   }
 
+  // --- Hover overlay rendering ---
+
   function chipText(el) {
-    var text = el.tagName.toLowerCase();
+    var text = pathTagName(el);
     if (el.id) {
       text += ' #' + el.id;
     }
@@ -117,14 +170,13 @@
     }
     box = document.createElement('div');
     box.setAttribute(OWN_ATTR, '');
-    box.style.cssText =
-      'position:fixed;z-index:2147483646;pointer-events:none;' +
-      'background:rgba(99,155,255,0.25);border:1px solid #639bff;' +
-      'border-radius:2px;display:none;';
+    box.style.cssText = HIGHLIGHT_BOX_CSS;
     chip = document.createElement('div');
     chip.setAttribute(OWN_ATTR, '');
     chip.style.cssText =
-      'position:fixed;z-index:2147483647;pointer-events:none;' +
+      'position:fixed;z-index:' +
+      Z_CHIP +
+      ';pointer-events:none;' +
       'background:#1e1e1e;color:#fff;font:12px/1.7 monospace;' +
       'padding:1px 6px;border-radius:3px;white-space:nowrap;display:none;' +
       'box-shadow:0 1px 4px rgba(0,0,0,0.4);';
@@ -143,8 +195,9 @@
     chip.textContent = chipText(el);
     chip.style.display = 'block';
     chip.style.left = Math.max(0, rect.left) + 'px';
-    var chipTop = rect.top - 24;
-    chip.style.top = (chipTop < 0 ? rect.bottom + 4 : chipTop) + 'px';
+    var chipTop = rect.top - CHIP_HEIGHT_PX;
+    chip.style.top =
+      (chipTop < 0 ? rect.bottom + CHIP_FLIP_GAP_PX : chipTop) + 'px';
   }
 
   function clearOverlay() {
@@ -170,10 +223,7 @@
     while (programmaticBoxes.length < programmaticEls.length) {
       var newBox = document.createElement('div');
       newBox.setAttribute(OWN_ATTR, '');
-      newBox.style.cssText =
-        'position:fixed;z-index:2147483646;pointer-events:none;' +
-        'background:rgba(99,155,255,0.25);border:1px solid #639bff;' +
-        'border-radius:2px;display:none;';
+      newBox.style.cssText = HIGHLIGHT_BOX_CSS;
       document.body.appendChild(newBox);
       programmaticBoxes.push(newBox);
     }
@@ -193,6 +243,8 @@
     }
   }
 
+  // --- DOM path resolution (protocol -> live element) ---
+
   // Walk a body-down structural path (same nth-of-type semantics the forward
   // direction uses) to a live element.
   function resolveDomPath(domPath) {
@@ -201,17 +253,19 @@
     }
     var current = document.body;
     for (var i = 1; i < domPath.length; i++) {
-      var match = /^([a-z0-9-]+):nth-of-type\((\d+)\)$/i.exec(domPath[i]);
+      var match = SEGMENT_REGEX.exec(domPath[i]);
       if (!match) {
         return null;
       }
-      var tag = match[1].toUpperCase();
+      // Case-insensitive: live HTML tagNames are uppercase, foreign elements
+      // camelCase, and source-derived paths lowercase/spec-case.
+      var tag = match[1].toLowerCase();
       var nth = Number(match[2]);
       var count = 0;
       var found = null;
       for (var c = 0; c < current.children.length; c++) {
         var child = current.children[c];
-        if (child.tagName === tag && !isInjectedNode(child)) {
+        if (child.tagName.toLowerCase() === tag && !isInjectedNode(child)) {
           count++;
           if (count === nth) {
             found = child;
@@ -227,6 +281,48 @@
     return current;
   }
 
+  // --- Iframe shields (see declaration comment) ---
+
+  function addIframeShields() {
+    var frames = document.querySelectorAll('iframe');
+    for (var i = 0; i < frames.length; i++) {
+      if (!isInspectable(frames[i])) {
+        continue;
+      }
+      var shield = document.createElement('div');
+      shield.setAttribute(OWN_ATTR, '');
+      // normalizeTarget maps hits on the shield back to its iframe.
+      shield.__jmShieldFor = frames[i];
+      shield.style.cssText =
+        'position:fixed;z-index:' + Z_IFRAME_SHIELD + ';background:transparent;';
+      positionBoxOnElement(shield, frames[i]);
+      document.body.appendChild(shield);
+      iframeShields.push(shield);
+    }
+  }
+
+  function removeIframeShields() {
+    for (var i = 0; i < iframeShields.length; i++) {
+      if (iframeShields[i].parentNode) {
+        iframeShields[i].parentNode.removeChild(iframeShields[i]);
+      }
+    }
+    iframeShields = [];
+  }
+
+  function repositionIframeShields() {
+    for (var i = 0; i < iframeShields.length; i++) {
+      var frame = iframeShields[i].__jmShieldFor;
+      if (document.contains(frame)) {
+        positionBoxOnElement(iframeShields[i], frame);
+      } else {
+        iframeShields[i].style.display = 'none';
+      }
+    }
+  }
+
+  // --- Overlay repositioning lifecycle ---
+
   function reposition() {
     var el = pinnedEl || hoverEl;
     if (el && document.contains(el)) {
@@ -241,6 +337,8 @@
         }),
       );
     }
+    repositionIframeShields();
+    syncRepositionListeners();
   }
 
   function attachReposition() {
@@ -258,6 +356,19 @@
       repositionAttached = false;
     }
   }
+
+  // The scroll/resize listeners are only needed while something is drawn;
+  // keep them attached exactly when that's the case so a cleared highlight
+  // doesn't leave a capture-phase scroll handler running forever.
+  function syncRepositionListeners() {
+    if (enabled || pinnedEl || programmaticEls.length) {
+      attachReposition();
+    } else {
+      detachReposition();
+    }
+  }
+
+  // --- Pointer handling (inspect mode) ---
 
   function setHover(el) {
     if (el === hoverEl) {
@@ -278,6 +389,9 @@
   // body". Map hits on <html> to <body> — like classic Web Lab, <html>
   // itself has no source mapping anyway.
   function normalizeTarget(el) {
+    if (el && el.__jmShieldFor) {
+      return el.__jmShieldFor;
+    }
     return el === document.documentElement ? document.body : el;
   }
 
@@ -293,12 +407,17 @@
   }
 
   function onClick(event) {
-    event.preventDefault();
-    event.stopPropagation();
     var el = normalizeTarget(
       document.elementFromPoint(event.clientX, event.clientY),
     );
-    if (!el || !isInspectable(el)) {
+    // Clicks on the devtools UI (eruda) must keep working while the
+    // inspector is on — only the student page's own clicks are swallowed.
+    if (el && !isInspectable(el)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (!el) {
       return;
     }
     pinnedEl = el;
@@ -310,10 +429,13 @@
     setEnabled(false);
   }
 
+  // --- Inspect-mode lifecycle ---
+
   function enable() {
     pinnedEl = null;
     clearOverlay();
-    attachReposition();
+    addIframeShields();
+    syncRepositionListeners();
     document.addEventListener('mousemove', onMouseMove, true);
     document.addEventListener('click', onClick, true);
     document.documentElement.addEventListener('mouseleave', onMouseLeave);
@@ -334,14 +456,15 @@
     }
     hoverEl = null;
     clearProgrammaticOverlays();
+    removeIframeShields();
     // A pinned highlight survives leaving inspector mode (until the next
     // enable or a page reload); a plain toggle-off clears everything.
     if (pinnedEl) {
       reposition();
     } else {
       clearOverlay();
-      detachReposition();
     }
+    syncRepositionListeners();
   }
 
   function setEnabled(value) {
@@ -356,10 +479,25 @@
     }
   }
 
+  // --- Protocol handler (parent -> page) ---
+
   window.addEventListener('message', function (event) {
+    // Only the embedding IDE (our direct parent) may drive the inspector —
+    // not nested iframes, popups, or the page's own JS. An origin allowlist
+    // isn't possible here: the IDE runs on several origins (prod, previews,
+    // localhost dev) and the scripts are also used in app webviews — so a
+    // page that embeds a student site can still command its own iframe.
+    if (event.source !== window.parent || event.source === window) {
+      return;
+    }
     var data = event.data;
     if (typeof data !== 'object' || data === null || !('type' in data)) {
       return;
+    }
+    // Reply only to the origin that is driving us ('null' is the opaque
+    // origin of a sandboxed embedder, which postMessage can't target).
+    if (event.origin && event.origin !== 'null') {
+      parentOrigin = event.origin;
     }
     if (data.type === 'setInspector') {
       setEnabled(!!data.enabled);
@@ -368,20 +506,22 @@
     if (data.type === 'highlightFromSource') {
       if (!data.domPath) {
         clearProgrammaticOverlays();
+        syncRepositionListeners();
         return;
       }
       var el = resolveDomPath(data.domPath);
       if (el) {
-        attachReposition();
         drawProgrammaticOverlays([el]);
       } else {
         clearProgrammaticOverlays();
       }
+      syncRepositionListeners();
       return;
     }
     if (data.type === 'highlightSelector') {
       if (!data.selector) {
         clearProgrammaticOverlays();
+        syncRepositionListeners();
         return;
       }
       var matches = [];
@@ -401,11 +541,11 @@
         // Students type selectors incrementally — invalid ones just clear.
       }
       if (matches.length) {
-        attachReposition();
         drawProgrammaticOverlays(matches);
       } else {
         clearProgrammaticOverlays();
       }
+      syncRepositionListeners();
       return;
     }
   });
